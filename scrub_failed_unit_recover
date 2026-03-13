@@ -1,0 +1,392 @@
+import os
+import re
+import glob
+import json
+import traceback
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
+
+import pandas as pd
+
+# =========================
+# Config
+# =========================
+BASE_DIR = r"C:\Users\QiuchiShan\OneDrive - Bitfarms\Austin Harrison's files - Toolkit exports"
+SITE_NAME = "scrub"
+
+START_DATE = pd.Timestamp("2025-08-01 00:00:00")
+END_DATE = pd.Timestamp("2026-03-10 23:59:59")
+
+OUTPUT_DIR = r"C:\Users\QiuchiShan\OneDrive - Bitfarms\data_eng"
+SEGMENTS_CSV = os.path.join(OUTPUT_DIR, "scrub_failure_segments.csv")
+CURRENT_JSON = os.path.join(OUTPUT_DIR, "miner_list_current.json")
+PROGRESS_JSON = os.path.join(OUTPUT_DIR, "scrub_progress.json")
+ERROR_LOG = os.path.join(OUTPUT_DIR, "scrub_error.log")
+
+MAX_WORKERS = 4
+USE_COLS = ["ip", "mac", "serial", "chainStatus"]
+
+INVALID_VALUES = {"", "NA", "N/A", "--", "null", "None", "-"}
+
+LIMIT_FILES = None          # e.g. 100 for testing
+CHECKPOINT_EVERY = 200      # 每处理多少个文件保存一次
+
+
+# =========================
+# Helpers
+# =========================
+filename_pattern = re.compile(
+    r"^scrub_(\d{4}-\d{2}-\d{2}-\d{4})_.*\.csv$",
+    re.IGNORECASE
+)
+
+def normalize_series(s: pd.Series) -> pd.Series:
+    """
+    向量化清洗：
+    - strip
+    - INVALID_VALUES 置空
+    """
+    s = s.astype("string").str.strip()
+    s = s.replace(list(INVALID_VALUES), pd.NA)
+    return s
+
+def parse_timestamp_from_filename(path):
+    """
+    例如:
+    scrub_2025-08-01-1500_24c.csv
+    """
+    name = os.path.basename(path)
+    m = filename_pattern.match(name)
+    if not m:
+        return pd.NaT
+    dt_str = m.group(1)
+    try:
+        return pd.to_datetime(dt_str, format="%Y-%m-%d-%H%M")
+    except Exception:
+        return pd.NaT
+
+def is_valid_target_file(path):
+    name = os.path.basename(path)
+
+    if "safeBackup" in name:
+        return False
+
+    ts = parse_timestamp_from_filename(path)
+    if pd.isna(ts):
+        return False
+
+    return START_DATE <= ts <= END_DATE
+
+def read_one_file(path):
+    """
+    只读取必要列，并返回轻量 dataframe:
+    timestamp, miner_id, miner_id_type, is_failure
+    """
+    ts = parse_timestamp_from_filename(path)
+
+    try:
+        df = pd.read_csv(
+            path,
+            usecols=lambda c: c in USE_COLS,
+            dtype="string",
+            low_memory=False
+        )
+    except ValueError as e:
+        print(f"[WARN] Skipped {path}: {e}")
+        return ts, None
+    except Exception as e:
+        print(f"[WARN] Failed to read {path}: {e}")
+        return ts, None
+
+    # 缺列时补空
+    for col in USE_COLS:
+        if col not in df.columns:
+            df[col] = pd.NA
+
+    if df.empty:
+        return ts, None
+
+    # 向量化清洗
+    for col in ["serial", "mac", "ip"]:
+        df[col] = normalize_series(df[col])
+
+    # 向量化生成 miner_id（serial > mac > ip）
+    df["miner_id"] = df["serial"].combine_first(df["mac"]).combine_first(df["ip"])
+
+    df["miner_id_type"] = pd.NA
+    df.loc[df["serial"].notna(), "miner_id_type"] = "serial"
+    df.loc[df["serial"].isna() & df["mac"].notna(), "miner_id_type"] = "mac"
+    df.loc[df["serial"].isna() & df["mac"].isna() & df["ip"].notna(), "miner_id_type"] = "ip"
+
+    df = df.dropna(subset=["miner_id"]).copy()
+    if df.empty:
+        return ts, None
+
+    df["chainStatus"] = df["chainStatus"].fillna("").astype(str)
+    df["is_failure"] = df["chainStatus"].str.contains("Failure", case=False, na=False)
+
+    # 同一文件内去重：同一个 miner_id 只要有一条 failure，就算 failure
+    dedup = (
+        df.groupby(["miner_id", "miner_id_type"], as_index=False)
+          .agg(is_failure=("is_failure", "max"))
+    )
+
+    dedup["timestamp"] = ts
+    dedup = dedup[["timestamp", "miner_id", "miner_id_type", "is_failure"]]
+
+    return ts, dedup
+
+
+# =========================
+# Stateful storage
+# =========================
+failure_segments = []
+miner_list_current = OrderedDict()
+# miner_list_current[miner_id] = {
+#   "miner_id": ...,
+#   "miner_id_type": ...,
+#   "start_failure_time": ...,
+#   "latest_failure_time": ...
+# }
+
+def open_new_failure_segment(miner_id, miner_id_type, ts):
+    failure_segments.append({
+        "miner_id": miner_id,
+        "miner_id_type": miner_id_type,
+        "start_failure_time": ts,
+        "latest_failure_time": ts,
+        "end_failure_time": pd.NaT,
+        "is_closed": False
+    })
+    miner_list_current[miner_id] = {
+        "miner_id": miner_id,
+        "miner_id_type": miner_id_type,
+        "start_failure_time": ts,
+        "latest_failure_time": ts
+    }
+
+def update_open_failure_segment(miner_id, ts):
+    miner_list_current[miner_id]["latest_failure_time"] = ts
+
+    for i in range(len(failure_segments) - 1, -1, -1):
+        row = failure_segments[i]
+        if row["miner_id"] == miner_id and (not row["is_closed"]):
+            row["latest_failure_time"] = ts
+            return
+
+def close_open_failure_segment(miner_id, ts):
+    for i in range(len(failure_segments) - 1, -1, -1):
+        row = failure_segments[i]
+        if row["miner_id"] == miner_id and (not row["is_closed"]):
+            row["end_failure_time"] = ts
+            row["is_closed"] = True
+            break
+
+    if miner_id in miner_list_current:
+        del miner_list_current[miner_id]
+
+def process_one_timestamp_df(df_ts):
+    """
+    按当前 timestamp 的数据更新状态机
+    """
+    if df_ts is None or df_ts.empty:
+        return
+
+    ts = df_ts["timestamp"].iloc[0]
+
+    observed_miners = set(df_ts["miner_id"].tolist())
+    failure_df = df_ts[df_ts["is_failure"]].copy()
+    failure_miners = set(failure_df["miner_id"].tolist())
+
+    # 1. 新增或更新 failure
+    if not failure_df.empty:
+        failure_records = (
+            failure_df[["miner_id", "miner_id_type"]]
+            .drop_duplicates()
+            .to_dict("records")
+        )
+
+        for rec in failure_records:
+            miner_id = rec["miner_id"]
+            miner_id_type = rec["miner_id_type"]
+
+            if miner_id not in miner_list_current:
+                open_new_failure_segment(miner_id, miner_id_type, ts)
+            else:
+                update_open_failure_segment(miner_id, ts)
+
+    # 2. 当前被观测到、但不是 failure、且还在 current 里的 miner，关闭
+    to_close = []
+    for miner_id in list(miner_list_current.keys()):
+        if miner_id in observed_miners and miner_id not in failure_miners:
+            to_close.append(miner_id)
+
+    for miner_id in to_close:
+        close_open_failure_segment(miner_id, ts)
+
+
+# =========================
+# Save helpers
+# =========================
+def build_segments_df():
+    segments_df = pd.DataFrame(failure_segments)
+
+    if segments_df.empty:
+        return segments_df
+
+    segments_df["start_failure_time"] = pd.to_datetime(segments_df["start_failure_time"], errors="coerce")
+    segments_df["latest_failure_time"] = pd.to_datetime(segments_df["latest_failure_time"], errors="coerce")
+    segments_df["end_failure_time"] = pd.to_datetime(segments_df["end_failure_time"], errors="coerce")
+
+    segments_df["duration_hours"] = pd.NA
+    mask_closed = segments_df["is_closed"] == True
+    segments_df.loc[mask_closed, "duration_hours"] = (
+        segments_df.loc[mask_closed, "end_failure_time"] -
+        segments_df.loc[mask_closed, "start_failure_time"]
+    ).dt.total_seconds() / 3600.0
+
+    segments_df = segments_df.sort_values(
+        ["start_failure_time", "miner_id"],
+        kind="stable"
+    ).reset_index(drop=True)
+
+    return segments_df
+
+def build_current_json_rows():
+    rows = []
+    for miner_id, info in miner_list_current.items():
+        rows.append({
+            "miner_id": info["miner_id"],
+            "miner_id_type": info["miner_id_type"],
+            "start_failure_time": None if pd.isna(info["start_failure_time"]) else str(info["start_failure_time"]),
+            "latest_failure_time": None if pd.isna(info["latest_failure_time"]) else str(info["latest_failure_time"]),
+        })
+    return rows
+
+def save_outputs(processed_count, total_files, last_file=None, status="running"):
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    segments_df = build_segments_df()
+    segments_df.to_csv(SEGMENTS_CSV, index=False)
+
+    current_json_rows = build_current_json_rows()
+    with open(CURRENT_JSON, "w", encoding="utf-8") as f:
+        json.dump(current_json_rows, f, ensure_ascii=False, indent=2)
+
+    progress_payload = {
+        "status": status,
+        "processed_count": processed_count,
+        "total_files": total_files,
+        "last_file": last_file,
+        "segments_csv": SEGMENTS_CSV,
+        "current_json": CURRENT_JSON,
+        "open_failure_miners": len(current_json_rows),
+        "total_failure_segments": len(segments_df)
+    }
+    with open(PROGRESS_JSON, "w", encoding="utf-8") as f:
+        json.dump(progress_payload, f, ensure_ascii=False, indent=2)
+
+    print(
+        f"[CHECKPOINT] processed={processed_count}/{total_files}, "
+        f"segments={len(segments_df)}, open_miners={len(current_json_rows)}, status={status}"
+    )
+
+
+# =========================
+# Main
+# =========================
+def main():
+    global failure_segments, miner_list_current
+
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    site_pattern = os.path.join(BASE_DIR, "**", SITE_NAME, "*.csv")
+    all_files = glob.glob(site_pattern, recursive=True)
+    print(f"Found {len(all_files)} csv files under {SITE_NAME} before filtering.")
+
+    target_files = [f for f in all_files if is_valid_target_file(f)]
+    target_files = sorted(target_files, key=parse_timestamp_from_filename)
+
+    if LIMIT_FILES is not None:
+        target_files = target_files[:LIMIT_FILES]
+
+    print(f"Kept {len(target_files)} target files after filtering date range and skipping safeBackup.")
+
+    if not target_files:
+        raise ValueError("No target files found.")
+
+    print("Start processing files in timestamp order...")
+
+    processed = 0
+    last_file = None
+
+    try:
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            future_map = OrderedDict()
+            for f in target_files:
+                future_map[f] = executor.submit(read_one_file, f)
+
+            for f, future in future_map.items():
+                ts, df_ts = future.result()
+                process_one_timestamp_df(df_ts)
+
+                processed += 1
+                last_file = f
+
+                if processed % CHECKPOINT_EVERY == 0 or processed == len(target_files):
+                    save_outputs(
+                        processed_count=processed,
+                        total_files=len(target_files),
+                        last_file=last_file,
+                        status="running" if processed < len(target_files) else "completed"
+                    )
+
+                if processed % 200 == 0 or processed == len(target_files):
+                    print(f"Processed {processed}/{len(target_files)} files...")
+
+    except Exception as e:
+        err_text = (
+            f"\n[ERROR] Pipeline failed after processing {processed}/{len(target_files)} files.\n"
+            f"Last file: {last_file}\n"
+            f"Exception: {repr(e)}\n\n"
+            f"{traceback.format_exc()}\n"
+        )
+        print(err_text)
+
+        with open(ERROR_LOG, "a", encoding="utf-8") as f:
+            f.write(err_text)
+
+        # 出错时也落盘
+        save_outputs(
+            processed_count=processed,
+            total_files=len(target_files),
+            last_file=last_file,
+            status="failed"
+        )
+        raise
+
+    finally:
+        # 无论如何再保存一次，防止最后一步炸掉
+        final_status = "completed" if processed == len(target_files) else "partial"
+        save_outputs(
+            processed_count=processed,
+            total_files=len(target_files),
+            last_file=last_file,
+            status=final_status
+        )
+
+        print("Done.")
+        print(f"Failure segments saved to: {SEGMENTS_CSV}")
+        print(f"Current failure miner list saved to: {CURRENT_JSON}")
+        print(f"Progress saved to: {PROGRESS_JSON}")
+        print(f"Error log: {ERROR_LOG}")
+
+        segments_df = build_segments_df()
+        current_json_rows = build_current_json_rows()
+
+        print(f"Total failure segments: {len(segments_df)}")
+        print(f"Current open failure miners: {len(current_json_rows)}")
+
+
+if __name__ == "__main__":
+    main()
