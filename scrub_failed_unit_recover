@@ -124,15 +124,19 @@ def read_one_file(path):
 
     df["chainStatus"] = df["chainStatus"].fillna("").astype(str)
     df["is_failure"] = df["chainStatus"].str.contains("Failure", case=False, na=False)
+    df["is_mining"] = df["chainStatus"].str.contains("Mining", case=False, na=False)
 
     # 同一文件内去重：同一个 miner_id 只要有一条 failure，就算 failure
     dedup = (
         df.groupby(["miner_id", "miner_id_type"], as_index=False)
-          .agg(is_failure=("is_failure", "max"))
+          .agg(
+              is_failure=("is_failure", "max"),
+              is_all_mining=("is_mining", "min")
+          )
     )
 
     dedup["timestamp"] = ts
-    dedup = dedup[["timestamp", "miner_id", "miner_id_type", "is_failure"]]
+    dedup = dedup[["timestamp", "miner_id", "miner_id_type", "is_failure", "is_all_mining"]]
 
     return ts, dedup
 
@@ -155,6 +159,8 @@ def open_new_failure_segment(miner_id, miner_id_type, ts):
         "miner_id_type": miner_id_type,
         "start_failure_time": ts,
         "latest_failure_time": ts,
+        "failure_cleared_time": pd.NaT,
+        "all_mining_time": pd.NaT,
         "end_failure_time": pd.NaT,
         "is_closed": False
     })
@@ -178,12 +184,26 @@ def close_open_failure_segment(miner_id, ts):
     for i in range(len(failure_segments) - 1, -1, -1):
         row = failure_segments[i]
         if row["miner_id"] == miner_id and (not row["is_closed"]):
+            if pd.isna(row["failure_cleared_time"]):
+                row["failure_cleared_time"] = ts
             row["end_failure_time"] = ts
             row["is_closed"] = True
             break
 
     if miner_id in miner_list_current:
         del miner_list_current[miner_id]
+
+
+def update_all_mining_time(miner_id, ts):
+    for i in range(len(failure_segments) - 1, -1, -1):
+        row = failure_segments[i]
+        if row["miner_id"] != miner_id:
+            continue
+        if pd.notna(row["all_mining_time"]):
+            continue
+        if pd.notna(row["start_failure_time"]) and ts <= row["start_failure_time"]:
+            continue
+        row["all_mining_time"] = ts
 
 def process_one_timestamp_df(df_ts):
     """
@@ -197,6 +217,7 @@ def process_one_timestamp_df(df_ts):
     observed_miners = set(df_ts["miner_id"].tolist())
     failure_df = df_ts[df_ts["is_failure"]].copy()
     failure_miners = set(failure_df["miner_id"].tolist())
+    all_mining_miners = set(df_ts[df_ts["is_all_mining"]]["miner_id"].tolist())
 
     # 1. 新增或更新 failure
     if not failure_df.empty:
@@ -224,6 +245,10 @@ def process_one_timestamp_df(df_ts):
     for miner_id in to_close:
         close_open_failure_segment(miner_id, ts)
 
+    # 3. 记录该时刻全链路都为 Mining 的首次时间（可用于已关闭但尚未 fully recovered 的段）
+    for miner_id in all_mining_miners:
+        update_all_mining_time(miner_id, ts)
+
 
 # =========================
 # Save helpers
@@ -236,19 +261,42 @@ def build_segments_df():
 
     segments_df["start_failure_time"] = pd.to_datetime(segments_df["start_failure_time"], errors="coerce")
     segments_df["latest_failure_time"] = pd.to_datetime(segments_df["latest_failure_time"], errors="coerce")
-    segments_df["end_failure_time"] = pd.to_datetime(segments_df["end_failure_time"], errors="coerce")
+    segments_df["failure_cleared_time"] = pd.to_datetime(segments_df["failure_cleared_time"], errors="coerce")
+    segments_df["all_mining_time"] = pd.to_datetime(segments_df["all_mining_time"], errors="coerce")
 
-    segments_df["duration_hours"] = pd.NA
-    mask_closed = segments_df["is_closed"] == True
-    segments_df.loc[mask_closed, "duration_hours"] = (
-        segments_df.loc[mask_closed, "end_failure_time"] -
-        segments_df.loc[mask_closed, "start_failure_time"]
+    segments_df["is_failure_cleared"] = segments_df["failure_cleared_time"].notna()
+    segments_df["is_fully_recovered"] = segments_df["all_mining_time"].notna()
+
+    segments_df["failure_clear_duration_hours"] = (
+        segments_df["failure_cleared_time"] - segments_df["start_failure_time"]
+    ).dt.total_seconds() / 3600.0
+
+    segments_df["full_recovery_duration_hours"] = (
+        segments_df["all_mining_time"] - segments_df["start_failure_time"]
+    ).dt.total_seconds() / 3600.0
+
+    segments_df["post_clear_recovery_duration_hours"] = (
+        segments_df["all_mining_time"] - segments_df["failure_cleared_time"]
     ).dt.total_seconds() / 3600.0
 
     segments_df = segments_df.sort_values(
         ["start_failure_time", "miner_id"],
         kind="stable"
     ).reset_index(drop=True)
+
+    segments_df = segments_df[[
+        "miner_id",
+        "miner_id_type",
+        "start_failure_time",
+        "latest_failure_time",
+        "failure_cleared_time",
+        "all_mining_time",
+        "is_failure_cleared",
+        "is_fully_recovered",
+        "failure_clear_duration_hours",
+        "full_recovery_duration_hours",
+        "post_clear_recovery_duration_hours"
+    ]]
 
     return segments_df
 
