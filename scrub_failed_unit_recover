@@ -27,7 +27,7 @@ USE_COLS = ["ip", "mac", "serial", "chainStatus"]
 INVALID_VALUES = {"", "NA", "N/A", "--", "null", "None", "-"}
 
 LIMIT_FILES = None          # e.g. 100 for testing
-CHECKPOINT_EVERY = 200      # 每处理多少个文件保存一次
+CHECKPOINT_EVERY = 500      # 每处理多少个文件保存一次
 
 
 # =========================
@@ -87,7 +87,7 @@ def read_one_file(path):
             path,
             usecols=lambda c: c in USE_COLS,
             dtype="string",
-            low_memory=False
+            na_filter=False
         )
     except ValueError as e:
         print(f"[WARN] Skipped {path}: {e}")
@@ -144,6 +144,8 @@ def read_one_file(path):
 # =========================
 failure_segments = []
 miner_list_current = OrderedDict()
+open_failure_index = {}
+all_mining_waiting_index = {}
 # miner_list_current[miner_id] = {
 #   "miner_id": ...,
 #   "miner_id_type": ...,
@@ -152,7 +154,7 @@ miner_list_current = OrderedDict()
 # }
 
 def open_new_failure_segment(miner_id, miner_id_type, ts):
-    failure_segments.append({
+    row = {
         "miner_id": miner_id,
         "miner_id_type": miner_id_type,
         "start_failure_time": ts,
@@ -161,7 +163,11 @@ def open_new_failure_segment(miner_id, miner_id_type, ts):
         "all_mining_time": pd.NaT,
         "end_failure_time": pd.NaT,
         "is_closed": False
-    })
+    }
+    failure_segments.append(row)
+    open_failure_index[miner_id] = row
+    all_mining_waiting_index.setdefault(miner_id, []).append(row)
+
     miner_list_current[miner_id] = {
         "miner_id": miner_id,
         "miner_id_type": miner_id_type,
@@ -171,37 +177,41 @@ def open_new_failure_segment(miner_id, miner_id_type, ts):
 
 def update_open_failure_segment(miner_id, ts):
     miner_list_current[miner_id]["latest_failure_time"] = ts
-
-    for i in range(len(failure_segments) - 1, -1, -1):
-        row = failure_segments[i]
-        if row["miner_id"] == miner_id and (not row["is_closed"]):
-            row["latest_failure_time"] = ts
-            return
+    row = open_failure_index.get(miner_id)
+    if row is not None:
+        row["latest_failure_time"] = ts
 
 def close_open_failure_segment(miner_id, ts):
-    for i in range(len(failure_segments) - 1, -1, -1):
-        row = failure_segments[i]
-        if row["miner_id"] == miner_id and (not row["is_closed"]):
-            if pd.isna(row["failure_cleared_time"]):
-                row["failure_cleared_time"] = ts
-            row["end_failure_time"] = ts
-            row["is_closed"] = True
-            break
+    row = open_failure_index.get(miner_id)
+    if row is not None:
+        if pd.isna(row["failure_cleared_time"]):
+            row["failure_cleared_time"] = ts
+        row["end_failure_time"] = ts
+        row["is_closed"] = True
+        open_failure_index.pop(miner_id, None)
 
     if miner_id in miner_list_current:
         del miner_list_current[miner_id]
 
 
 def update_all_mining_time(miner_id, ts):
-    for i in range(len(failure_segments) - 1, -1, -1):
-        row = failure_segments[i]
-        if row["miner_id"] != miner_id:
-            continue
+    waiting_rows = all_mining_waiting_index.get(miner_id)
+    if not waiting_rows:
+        return
+
+    remaining_rows = []
+    for row in waiting_rows:
         if pd.notna(row["all_mining_time"]):
             continue
         if pd.notna(row["start_failure_time"]) and ts <= row["start_failure_time"]:
+            remaining_rows.append(row)
             continue
         row["all_mining_time"] = ts
+
+    if remaining_rows:
+        all_mining_waiting_index[miner_id] = remaining_rows
+    else:
+        all_mining_waiting_index.pop(miner_id, None)
 
 def process_one_timestamp_df(df_ts):
     """
@@ -244,7 +254,8 @@ def process_one_timestamp_df(df_ts):
         close_open_failure_segment(miner_id, ts)
 
     # 3. 记录该时刻全链路都为 Mining 的首次时间（可用于已关闭但尚未 fully recovered 的段）
-    for miner_id in all_mining_miners:
+    miners_ready_for_recovery = all_mining_miners.intersection(all_mining_waiting_index.keys())
+    for miner_id in miners_ready_for_recovery:
         update_all_mining_time(miner_id, ts)
 
 
@@ -342,7 +353,7 @@ def save_outputs(processed_count, total_files, last_file=None, status="running")
 # Main
 # =========================
 def main():
-    global failure_segments, miner_list_current
+    global failure_segments, miner_list_current, open_failure_index, all_mining_waiting_index
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
