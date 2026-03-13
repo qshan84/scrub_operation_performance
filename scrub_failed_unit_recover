@@ -4,7 +4,6 @@ import glob
 import json
 import traceback
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor
 
 import pandas as pd
 
@@ -23,7 +22,6 @@ CURRENT_JSON = os.path.join(OUTPUT_DIR, "miner_list_current.json")
 PROGRESS_JSON = os.path.join(OUTPUT_DIR, "scrub_progress.json")
 ERROR_LOG = os.path.join(OUTPUT_DIR, "scrub_error.log")
 
-MAX_WORKERS = 4
 USE_COLS = ["ip", "mac", "serial", "chainStatus"]
 
 INVALID_VALUES = {"", "NA", "N/A", "--", "null", "None", "-"}
@@ -369,28 +367,23 @@ def main():
     last_file = None
 
     try:
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            future_map = OrderedDict()
-            for f in target_files:
-                future_map[f] = executor.submit(read_one_file, f)
+        for f in target_files:
+            ts, df_ts = read_one_file(f)
+            process_one_timestamp_df(df_ts)
 
-            for f, future in future_map.items():
-                ts, df_ts = future.result()
-                process_one_timestamp_df(df_ts)
+            processed += 1
+            last_file = f
 
-                processed += 1
-                last_file = f
+            if processed % CHECKPOINT_EVERY == 0 or processed == len(target_files):
+                save_outputs(
+                    processed_count=processed,
+                    total_files=len(target_files),
+                    last_file=last_file,
+                    status="running" if processed < len(target_files) else "completed"
+                )
 
-                if processed % CHECKPOINT_EVERY == 0 or processed == len(target_files):
-                    save_outputs(
-                        processed_count=processed,
-                        total_files=len(target_files),
-                        last_file=last_file,
-                        status="running" if processed < len(target_files) else "completed"
-                    )
-
-                if processed % 200 == 0 or processed == len(target_files):
-                    print(f"Processed {processed}/{len(target_files)} files...")
+            if processed % 200 == 0 or processed == len(target_files):
+                print(f"Processed {processed}/{len(target_files)} files...")
 
     except Exception as e:
         err_text = (
