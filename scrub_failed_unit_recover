@@ -170,7 +170,7 @@ def open_new_failure_segment(miner_id, miner_id_type, ts):
         "miner_id_type": miner_id_type,
         "start_failure_time": ts,
         "latest_failure_time": ts,
-        "latest_seen_time": pd.NaT,
+        "latest_seen_time": ts,
         "failure_cleared_time": pd.NaT,
         "all_mining_time": pd.NaT,
         "end_failure_time": pd.NaT,
@@ -227,17 +227,12 @@ def update_all_mining_time(miner_id, ts):
 
 
 
-def update_latest_seen_time_for_active(observed_miners, ts):
+def update_latest_seen_time_for_open(observed_miners, ts):
     miners_to_update = observed_miners.intersection(open_failure_index.keys())
     for miner_id in miners_to_update:
         row = open_failure_index.get(miner_id)
-        if row is None:
-            continue
-        if pd.notna(row["all_mining_time"]):
-            continue
-        if pd.notna(row["start_failure_time"]) and ts <= row["start_failure_time"]:
-            continue
-        row["latest_seen_time"] = ts
+        if row is not None:
+            row["latest_seen_time"] = ts
 
 def process_one_timestamp_df(df_ts):
     """
@@ -271,6 +266,9 @@ def process_one_timestamp_df(df_ts):
             else:
                 update_open_failure_segment(miner_id, ts)
 
+    # 2.5 更新 latest_seen_time（仅 open segment，包含关闭快照）
+    update_latest_seen_time_for_open(observed_miners, ts)
+
     # 2. 当前被观测到、但不是 failure、且还在 current 里的 miner，关闭
     to_close = []
     for miner_id in list(miner_list_current.keys()):
@@ -285,8 +283,6 @@ def process_one_timestamp_df(df_ts):
     for miner_id in miners_ready_for_recovery:
         update_all_mining_time(miner_id, ts)
 
-    # 4. 更新 latest_seen_time（仅 active 且 all_mining_time 仍为空）
-    update_latest_seen_time_for_active(observed_miners, ts)
 
 
 # =========================
