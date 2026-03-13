@@ -170,6 +170,7 @@ def open_new_failure_segment(miner_id, miner_id_type, ts):
         "miner_id_type": miner_id_type,
         "start_failure_time": ts,
         "latest_failure_time": ts,
+        "latest_seen_time": pd.NaT,
         "failure_cleared_time": pd.NaT,
         "all_mining_time": pd.NaT,
         "end_failure_time": pd.NaT,
@@ -224,6 +225,20 @@ def update_all_mining_time(miner_id, ts):
     else:
         all_mining_waiting_index.pop(miner_id, None)
 
+
+
+def update_latest_seen_time_for_active(observed_miners, ts):
+    miners_to_update = observed_miners.intersection(open_failure_index.keys())
+    for miner_id in miners_to_update:
+        row = open_failure_index.get(miner_id)
+        if row is None:
+            continue
+        if pd.notna(row["all_mining_time"]):
+            continue
+        if pd.notna(row["start_failure_time"]) and ts <= row["start_failure_time"]:
+            continue
+        row["latest_seen_time"] = ts
+
 def process_one_timestamp_df(df_ts):
     """
     按当前 timestamp 的数据更新状态机
@@ -234,6 +249,7 @@ def process_one_timestamp_df(df_ts):
     ts = df_ts["timestamp"].iloc[0]
 
     observed_miners = set(df_ts["miner_id"].tolist())
+
     failure_df = df_ts[df_ts["is_failure"]].copy()
     failure_miners = set(failure_df["miner_id"].tolist())
     all_mining_miners = set(df_ts[df_ts["is_all_mining"]]["miner_id"].tolist())
@@ -269,6 +285,9 @@ def process_one_timestamp_df(df_ts):
     for miner_id in miners_ready_for_recovery:
         update_all_mining_time(miner_id, ts)
 
+    # 4. 更新 latest_seen_time（仅 active 且 all_mining_time 仍为空）
+    update_latest_seen_time_for_active(observed_miners, ts)
+
 
 # =========================
 # Save helpers
@@ -281,6 +300,7 @@ def build_segments_df():
 
     segments_df["start_failure_time"] = pd.to_datetime(segments_df["start_failure_time"], errors="coerce")
     segments_df["latest_failure_time"] = pd.to_datetime(segments_df["latest_failure_time"], errors="coerce")
+    segments_df["latest_seen_time"] = pd.to_datetime(segments_df["latest_seen_time"], errors="coerce")
     segments_df["failure_cleared_time"] = pd.to_datetime(segments_df["failure_cleared_time"], errors="coerce")
     segments_df["all_mining_time"] = pd.to_datetime(segments_df["all_mining_time"], errors="coerce")
 
@@ -309,6 +329,7 @@ def build_segments_df():
         "miner_id_type",
         "start_failure_time",
         "latest_failure_time",
+        "latest_seen_time",
         "failure_cleared_time",
         "all_mining_time",
         "is_failure_cleared",
