@@ -4,7 +4,6 @@ import glob
 import json
 import traceback
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor
 
 import pandas as pd
 
@@ -23,13 +22,12 @@ CURRENT_JSON = os.path.join(OUTPUT_DIR, "miner_list_current.json")
 PROGRESS_JSON = os.path.join(OUTPUT_DIR, "scrub_progress.json")
 ERROR_LOG = os.path.join(OUTPUT_DIR, "scrub_error.log")
 
-MAX_WORKERS = 4
 USE_COLS = ["ip", "mac", "serial", "chainStatus"]
 
 INVALID_VALUES = {"", "NA", "N/A", "--", "null", "None", "-"}
 
 LIMIT_FILES = None          # e.g. 100 for testing
-CHECKPOINT_EVERY = 200      # 每处理多少个文件保存一次
+CHECKPOINT_EVERY = 500      # 每处理多少个文件保存一次
 
 
 # =========================
@@ -89,7 +87,7 @@ def read_one_file(path):
             path,
             usecols=lambda c: c in USE_COLS,
             dtype="string",
-            low_memory=False
+            na_filter=False
         )
     except ValueError as e:
         print(f"[WARN] Skipped {path}: {e}")
@@ -123,16 +121,31 @@ def read_one_file(path):
         return ts, None
 
     df["chainStatus"] = df["chainStatus"].fillna("").astype(str)
-    df["is_failure"] = df["chainStatus"].str.contains("Failure", case=False, na=False)
+    chain_status_norm = df["chainStatus"].str.replace(r"\s+", " ", regex=True).str.strip()
+
+    # chainStatus 视为一个 miner 的状态 token 列表（空白分隔）
+    # is_failure: 任一 token 精确等于 "Failure"
+    df["is_failure"] = chain_status_norm.str.contains(r"(^|\s)Failure(\s|$)", regex=True, na=False)
+
+    # is_all_mining: 仅当标准化后精确等于以下之一才为 True
+    # "Mining", "Mining Mining", "Mining Mining Mining"
+    df["is_all_mining"] = chain_status_norm.isin([
+        "Mining",
+        "Mining Mining",
+        "Mining Mining Mining"
+    ])
 
     # 同一文件内去重：同一个 miner_id 只要有一条 failure，就算 failure
     dedup = (
         df.groupby(["miner_id", "miner_id_type"], as_index=False)
-          .agg(is_failure=("is_failure", "max"))
+          .agg(
+              is_failure=("is_failure", "max"),
+              is_all_mining=("is_all_mining", "max")
+          )
     )
 
     dedup["timestamp"] = ts
-    dedup = dedup[["timestamp", "miner_id", "miner_id_type", "is_failure"]]
+    dedup = dedup[["timestamp", "miner_id", "miner_id_type", "is_failure", "is_all_mining"]]
 
     return ts, dedup
 
@@ -142,6 +155,8 @@ def read_one_file(path):
 # =========================
 failure_segments = []
 miner_list_current = OrderedDict()
+open_failure_index = {}
+all_mining_waiting_index = {}
 # miner_list_current[miner_id] = {
 #   "miner_id": ...,
 #   "miner_id_type": ...,
@@ -150,14 +165,21 @@ miner_list_current = OrderedDict()
 # }
 
 def open_new_failure_segment(miner_id, miner_id_type, ts):
-    failure_segments.append({
+    row = {
         "miner_id": miner_id,
         "miner_id_type": miner_id_type,
         "start_failure_time": ts,
         "latest_failure_time": ts,
+        "latest_seen_time": ts,
+        "failure_cleared_time": pd.NaT,
+        "all_mining_time": pd.NaT,
         "end_failure_time": pd.NaT,
         "is_closed": False
-    })
+    }
+    failure_segments.append(row)
+    open_failure_index[miner_id] = row
+    all_mining_waiting_index.setdefault(miner_id, []).append(row)
+
     miner_list_current[miner_id] = {
         "miner_id": miner_id,
         "miner_id_type": miner_id_type,
@@ -167,23 +189,50 @@ def open_new_failure_segment(miner_id, miner_id_type, ts):
 
 def update_open_failure_segment(miner_id, ts):
     miner_list_current[miner_id]["latest_failure_time"] = ts
-
-    for i in range(len(failure_segments) - 1, -1, -1):
-        row = failure_segments[i]
-        if row["miner_id"] == miner_id and (not row["is_closed"]):
-            row["latest_failure_time"] = ts
-            return
+    row = open_failure_index.get(miner_id)
+    if row is not None:
+        row["latest_failure_time"] = ts
 
 def close_open_failure_segment(miner_id, ts):
-    for i in range(len(failure_segments) - 1, -1, -1):
-        row = failure_segments[i]
-        if row["miner_id"] == miner_id and (not row["is_closed"]):
-            row["end_failure_time"] = ts
-            row["is_closed"] = True
-            break
+    row = open_failure_index.get(miner_id)
+    if row is not None:
+        if pd.isna(row["failure_cleared_time"]):
+            row["failure_cleared_time"] = ts
+        row["end_failure_time"] = ts
+        row["is_closed"] = True
+        open_failure_index.pop(miner_id, None)
 
     if miner_id in miner_list_current:
         del miner_list_current[miner_id]
+
+
+def update_all_mining_time(miner_id, ts):
+    waiting_rows = all_mining_waiting_index.get(miner_id)
+    if not waiting_rows:
+        return
+
+    remaining_rows = []
+    for row in waiting_rows:
+        if pd.notna(row["all_mining_time"]):
+            continue
+        if pd.notna(row["start_failure_time"]) and ts <= row["start_failure_time"]:
+            remaining_rows.append(row)
+            continue
+        row["all_mining_time"] = ts
+
+    if remaining_rows:
+        all_mining_waiting_index[miner_id] = remaining_rows
+    else:
+        all_mining_waiting_index.pop(miner_id, None)
+
+
+
+def update_latest_seen_time_for_open(observed_miners, ts):
+    miners_to_update = observed_miners.intersection(open_failure_index.keys())
+    for miner_id in miners_to_update:
+        row = open_failure_index.get(miner_id)
+        if row is not None:
+            row["latest_seen_time"] = ts
 
 def process_one_timestamp_df(df_ts):
     """
@@ -195,8 +244,10 @@ def process_one_timestamp_df(df_ts):
     ts = df_ts["timestamp"].iloc[0]
 
     observed_miners = set(df_ts["miner_id"].tolist())
+
     failure_df = df_ts[df_ts["is_failure"]].copy()
     failure_miners = set(failure_df["miner_id"].tolist())
+    all_mining_miners = set(df_ts[df_ts["is_all_mining"]]["miner_id"].tolist())
 
     # 1. 新增或更新 failure
     if not failure_df.empty:
@@ -215,6 +266,9 @@ def process_one_timestamp_df(df_ts):
             else:
                 update_open_failure_segment(miner_id, ts)
 
+    # 2.5 更新 latest_seen_time（仅 open segment，包含关闭快照）
+    update_latest_seen_time_for_open(observed_miners, ts)
+
     # 2. 当前被观测到、但不是 failure、且还在 current 里的 miner，关闭
     to_close = []
     for miner_id in list(miner_list_current.keys()):
@@ -223,6 +277,12 @@ def process_one_timestamp_df(df_ts):
 
     for miner_id in to_close:
         close_open_failure_segment(miner_id, ts)
+
+    # 3. 记录该时刻全链路都为 Mining 的首次时间（可用于已关闭但尚未 fully recovered 的段）
+    miners_ready_for_recovery = all_mining_miners.intersection(all_mining_waiting_index.keys())
+    for miner_id in miners_ready_for_recovery:
+        update_all_mining_time(miner_id, ts)
+
 
 
 # =========================
@@ -236,19 +296,44 @@ def build_segments_df():
 
     segments_df["start_failure_time"] = pd.to_datetime(segments_df["start_failure_time"], errors="coerce")
     segments_df["latest_failure_time"] = pd.to_datetime(segments_df["latest_failure_time"], errors="coerce")
-    segments_df["end_failure_time"] = pd.to_datetime(segments_df["end_failure_time"], errors="coerce")
+    segments_df["latest_seen_time"] = pd.to_datetime(segments_df["latest_seen_time"], errors="coerce")
+    segments_df["failure_cleared_time"] = pd.to_datetime(segments_df["failure_cleared_time"], errors="coerce")
+    segments_df["all_mining_time"] = pd.to_datetime(segments_df["all_mining_time"], errors="coerce")
 
-    segments_df["duration_hours"] = pd.NA
-    mask_closed = segments_df["is_closed"] == True
-    segments_df.loc[mask_closed, "duration_hours"] = (
-        segments_df.loc[mask_closed, "end_failure_time"] -
-        segments_df.loc[mask_closed, "start_failure_time"]
+    segments_df["is_failure_cleared"] = segments_df["failure_cleared_time"].notna()
+    segments_df["is_fully_recovered"] = segments_df["all_mining_time"].notna()
+
+    segments_df["failure_clear_duration_hours"] = (
+        segments_df["failure_cleared_time"] - segments_df["start_failure_time"]
+    ).dt.total_seconds() / 3600.0
+
+    segments_df["full_recovery_duration_hours"] = (
+        segments_df["all_mining_time"] - segments_df["start_failure_time"]
+    ).dt.total_seconds() / 3600.0
+
+    segments_df["post_clear_recovery_duration_hours"] = (
+        segments_df["all_mining_time"] - segments_df["failure_cleared_time"]
     ).dt.total_seconds() / 3600.0
 
     segments_df = segments_df.sort_values(
         ["start_failure_time", "miner_id"],
         kind="stable"
     ).reset_index(drop=True)
+
+    segments_df = segments_df[[
+        "miner_id",
+        "miner_id_type",
+        "start_failure_time",
+        "latest_failure_time",
+        "latest_seen_time",
+        "failure_cleared_time",
+        "all_mining_time",
+        "is_failure_cleared",
+        "is_fully_recovered",
+        "failure_clear_duration_hours",
+        "full_recovery_duration_hours",
+        "post_clear_recovery_duration_hours"
+    ]]
 
     return segments_df
 
@@ -296,7 +381,7 @@ def save_outputs(processed_count, total_files, last_file=None, status="running")
 # Main
 # =========================
 def main():
-    global failure_segments, miner_list_current
+    global failure_segments, miner_list_current, open_failure_index, all_mining_waiting_index
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -321,28 +406,23 @@ def main():
     last_file = None
 
     try:
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            future_map = OrderedDict()
-            for f in target_files:
-                future_map[f] = executor.submit(read_one_file, f)
+        for f in target_files:
+            ts, df_ts = read_one_file(f)
+            process_one_timestamp_df(df_ts)
 
-            for f, future in future_map.items():
-                ts, df_ts = future.result()
-                process_one_timestamp_df(df_ts)
+            processed += 1
+            last_file = f
 
-                processed += 1
-                last_file = f
+            if processed % CHECKPOINT_EVERY == 0 or processed == len(target_files):
+                save_outputs(
+                    processed_count=processed,
+                    total_files=len(target_files),
+                    last_file=last_file,
+                    status="running" if processed < len(target_files) else "completed"
+                )
 
-                if processed % CHECKPOINT_EVERY == 0 or processed == len(target_files):
-                    save_outputs(
-                        processed_count=processed,
-                        total_files=len(target_files),
-                        last_file=last_file,
-                        status="running" if processed < len(target_files) else "completed"
-                    )
-
-                if processed % 200 == 0 or processed == len(target_files):
-                    print(f"Processed {processed}/{len(target_files)} files...")
+            if processed % 200 == 0 or processed == len(target_files):
+                print(f"Processed {processed}/{len(target_files)} files...")
 
     except Exception as e:
         err_text = (
