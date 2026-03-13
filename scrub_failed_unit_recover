@@ -121,15 +121,23 @@ def read_one_file(path):
         return ts, None
 
     df["chainStatus"] = df["chainStatus"].fillna("").astype(str)
-    df["is_failure"] = df["chainStatus"].str.contains("Failure", case=False, na=False)
-    df["is_mining"] = df["chainStatus"].str.contains("Mining", case=False, na=False)
+    chain_tokens = df["chainStatus"].str.split()
+
+    # chainStatus 视为一个 miner 的状态 token 列表（空白分隔）
+    # is_failure: 任一 token 精确等于 "Failure"
+    df["is_failure"] = chain_tokens.apply(lambda tokens: any(t == "Failure" for t in tokens))
+
+    # is_all_mining: token 列表非空且所有 token 精确等于 "Mining"
+    df["is_all_mining"] = chain_tokens.apply(
+        lambda tokens: len(tokens) > 0 and all(t == "Mining" for t in tokens)
+    )
 
     # 同一文件内去重：同一个 miner_id 只要有一条 failure，就算 failure
     dedup = (
         df.groupby(["miner_id", "miner_id_type"], as_index=False)
           .agg(
               is_failure=("is_failure", "max"),
-              is_all_mining=("is_mining", "min")
+              is_all_mining=("is_all_mining", "max")
           )
     )
 
